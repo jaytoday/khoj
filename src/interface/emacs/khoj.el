@@ -1,11 +1,12 @@
-;;; khoj.el --- AI personal assistant for your digital brain -*- lexical-binding: t -*-
+;;; khoj.el --- AI copilot for your Second Brain -*- lexical-binding: t -*-
 
-;; Copyright (C) 2021-2022 Debanjum Singh Solanky
+;; Copyright (C) 2021-2023 Khoj Inc.
 
-;; Author: Debanjum Singh Solanky <debanjum@gmail.com>
-;; Description: An AI personal assistant for your digital brain
+;; Author: Debanjum Singh Solanky <debanjum@khoj.dev>
+;;         Saba Imran <saba@khoj.dev>
+;; Description: An AI copilot for your Second Brain
 ;; Keywords: search, chat, org-mode, outlines, markdown, pdf, image
-;; Version: 0.8.2
+;; Version: 1.2.1
 ;; Package-Requires: ((emacs "27.1") (transient "0.3.0") (dash "2.19.1"))
 ;; URL: https://github.com/khoj-ai/khoj/tree/master/src/interface/emacs
 
@@ -28,8 +29,8 @@
 
 ;;; Commentary:
 
-;; Create an AI personal assistant for your `org-mode', `markdown' notes,
-;; PDFs and images. The assistant exposes 2 modes, search and chat:
+;; Create an AI copilot to your `org-mode', `markdown' notes,
+;; PDFs and images. The copilot exposes 2 modes, search and chat:
 ;;
 ;; Chat provides faster answers, iterative discovery and assisted
 ;; creativity. It requires your OpenAI API key to access GPT models
@@ -62,7 +63,7 @@
 ;; Khoj Static Configuration
 ;; -------------------------
 
-(defcustom khoj-server-url "http://localhost:42110"
+(defcustom khoj-server-url "https://app.khoj.dev"
   "Location of Khoj API server."
   :group 'khoj
   :type 'string)
@@ -86,6 +87,26 @@
   "Number of results to show in search and use for chat responses."
   :group 'khoj
   :type 'integer)
+
+(defcustom khoj-search-on-idle-time 0.3
+  "Idle time (in seconds) to wait before triggering search."
+  :group 'khoj
+  :type 'number)
+
+(defcustom khoj-api-key nil
+  "API Key to your Khoj. Default at https://app.khoj.dev/config#clients."
+  :group 'khoj
+  :type 'string)
+
+(defcustom khoj-auto-index t
+  "Should content be automatically re-indexed every `khoj-index-interval' seconds."
+  :group 'khoj
+  :type 'boolean)
+
+(defcustom khoj-index-interval 3600
+  "Interval (in seconds) to wait before updating content index."
+  :group 'khoj
+  :type 'number)
 
 (defcustom khoj-default-content-type "org"
   "The default content type to perform search on."
@@ -114,6 +135,15 @@
 
 (defvar khoj--content-type "org"
   "The type of content to perform search on.")
+
+(defvar khoj--search-on-idle-timer nil
+  "Idle timer to trigger incremental search.")
+
+(defvar khoj--index-timer nil
+  "Timer to trigger content indexing.")
+
+(defvar khoj--indexed-files '()
+  "Files that were indexed in previous content indexing run.")
 
 (declare-function org-element-property "org-mode" (PROPERTY ELEMENT))
 (declare-function org-element-type "org-mode" (ELEMENT))
@@ -211,7 +241,7 @@ for example), set this to the full interpreter path."
           (member val '("python" "python3" "pythonw" "py")))
   :group 'khoj)
 
-(defcustom khoj-org-files (org-agenda-files t t)
+(defcustom khoj-org-files nil
   "List of org-files to index on khoj server."
   :type '(repeat string)
   :group 'khoj)
@@ -221,9 +251,17 @@ for example), set this to the full interpreter path."
   :type '(repeat string)
   :group 'khoj)
 
-(defcustom khoj-openai-api-key nil
-  "OpenAI API key used to configure chat on khoj server."
-  :type 'string
+(make-obsolete-variable 'khoj-org-directories 'khoj-index-directories "1.2.0" 'set)
+(make-obsolete-variable 'khoj-org-files 'khoj-index-files "1.2.0" 'set)
+
+(defcustom khoj-index-files (org-agenda-files t t)
+  "List of org, markdown, pdf and other plaintext to index on khoj server."
+  :type '(repeat string)
+  :group 'khoj)
+
+(defcustom khoj-index-directories nil
+  "List of directories with org, markdown, pdf and other plaintext files to index on khoj server."
+  :type '(repeat string)
   :group 'khoj)
 
 (defcustom khoj-auto-setup t
@@ -279,8 +317,7 @@ Auto invokes setup steps on calling main entrypoint."
            :filter (lambda (process msg)
                      (cond ((string-match (format "Uvicorn running on %s" khoj-server-url) msg)
                             (progn
-                              (setq khoj--server-ready? t)
-                              (khoj--server-configure)))
+                              (setq khoj--server-ready? t)))
                            ((string-match "Batches:  " msg)
                             (when (string-match "\\([0-9]+\\.[0-9]+\\|\\([0-9]+\\)\\)%?" msg)
                               (message "khoj.el: %s updating index %s"
@@ -343,130 +380,13 @@ Auto invokes setup steps on calling main entrypoint."
   (when (not (khoj--server-started?))
     (khoj--server-start)))
 
-(defun khoj--get-directory-from-config (config keys &optional level)
-  "Extract directory under specified KEYS in CONFIG and trim it to LEVEL.
-CONFIG is json obtained from Khoj config API."
-  (let ((item config))
-    (dolist (key keys)
-      (setq item (cdr (assoc key item))))
-      (-> item
-          (split-string "/")
-          (butlast (or level nil))
-          (string-join "/"))))
-
-(defun khoj--server-configure ()
-  "Configure the the Khoj server for search and chat."
-  (interactive)
-  (let* ((org-directory-regexes (or (mapcar (lambda (dir) (format "%s/**/*.org" dir)) khoj-org-directories) json-null))
-         (current-config
-          (with-temp-buffer
-            (url-insert-file-contents (format "%s/api/config/data" khoj-server-url))
-            (ignore-error json-end-of-file (json-parse-buffer :object-type 'alist :array-type 'list :null-object json-null :false-object json-false))))
-         (default-config
-           (with-temp-buffer
-             (url-insert-file-contents (format "%s/api/config/data/default" khoj-server-url))
-             (ignore-error json-end-of-file (json-parse-buffer :object-type 'alist :array-type 'list :null-object json-null :false-object json-false))))
-         (default-index-dir (khoj--get-directory-from-config default-config '(content-type org embeddings-file)))
-         (default-chat-dir (khoj--get-directory-from-config default-config '(processor conversation conversation-logfile)))
-         (default-model (or (alist-get 'model (alist-get 'conversation (alist-get 'processor default-config))) "text-davinci-003"))
-         (config (or current-config default-config)))
-
-    ;; Configure content types
-    (cond
-     ;; If khoj backend is not configured yet
-     ((not current-config)
-      (message "khoj.el: Server not configured yet.")
-      (setq config (delq (assoc 'content-type config) config))
-      (cl-pushnew `(content-type . ((org . ((input-files . ,khoj-org-files)
-                                            (input-filter . ,org-directory-regexes)
-                                            (compressed-jsonl . ,(format "%s/org.jsonl.gz" default-index-dir))
-                                            (embeddings-file . ,(format "%s/org.pt" default-index-dir))
-                                            (index-heading-entries . ,json-false)))))
-                  config))
-
-     ;; Else if khoj config has no org content config
-     ((not (alist-get 'org (alist-get 'content-type config)))
-      (message "khoj.el: Org-mode content on server not configured yet.")
-     (let ((new-content-type (alist-get 'content-type config)))
-        (setq new-content-type (delq (assoc 'org new-content-type) new-content-type))
-        (cl-pushnew `(org . ((input-files . ,khoj-org-files)
-                             (input-filter . ,org-directory-regexes)
-                             (compressed-jsonl . ,(format "%s/org.jsonl.gz" default-index-dir))
-                             (embeddings-file . ,(format "%s/org.pt" default-index-dir))
-                             (index-heading-entries . ,json-false)))
-                    new-content-type)
-        (setq config (delq (assoc 'content-type config) config))
-        (cl-pushnew `(content-type . ,new-content-type) config)))
-
-     ;; Else if khoj is not configured to index specified org files
-     ((not (and (equal (alist-get 'input-files (alist-get 'org (alist-get 'content-type config))) khoj-org-files)
-                (equal (alist-get 'input-filter (alist-get 'org (alist-get 'content-type config))) org-directory-regexes)))
-      (message "khoj.el: Org-mode content on server is stale.")
-      (let* ((index-directory (khoj--get-directory-from-config config '(content-type org embeddings-file)))
-             (new-content-type (alist-get 'content-type config)))
-        (setq new-content-type (delq (assoc 'org new-content-type) new-content-type))
-        (cl-pushnew `(org . ((input-files . ,khoj-org-files)
-                             (input-filter . ,org-directory-regexes)
-                             (compressed-jsonl . ,(format "%s/org.jsonl.gz" index-directory))
-                             (embeddings-file . ,(format "%s/org.pt" index-directory))
-                             (index-heading-entries . ,json-false)))
-                    new-content-type)
-        (setq config (delq (assoc 'content-type config) config))
-        (cl-pushnew `(content-type . ,new-content-type) config))))
-
-    ;; Configure processors
-    (cond
-     ((not khoj-openai-api-key)
-      (setq config (delq (assoc 'processor config) config)))
-
-     ((not current-config)
-      (message "khoj.el: Chat not configured yet.")
-      (setq config (delq (assoc 'processor config) config))
-      (cl-pushnew `(processor . ((conversation . ((conversation-logfile . ,(format "%s/conversation.json" default-chat-dir))
-                                                  (model . ,default-model)
-                                                  (openai-api-key . ,khoj-openai-api-key)))))
-                  config))
-
-     ((not (alist-get 'conversation (alist-get 'processor config)))
-      (message "khoj.el: Chat not configured yet.")
-       (let ((new-processor-type (alist-get 'processor config)))
-         (setq new-processor-type (delq (assoc 'conversation new-processor-type) new-processor-type))
-         (cl-pushnew `(conversation . ((conversation-logfile . ,(format "%s/conversation.json" default-chat-dir))
-                                       (model . ,default-model)
-                                       (openai-api-key . ,khoj-openai-api-key)))
-                     new-processor-type)
-        (setq config (delq (assoc 'processor config) config))
-        (cl-pushnew `(processor . ,new-processor-type) config)))
-
-     ;; Else if khoj is not configured with specified openai api key
-     ((not (equal (alist-get 'openai-api-key (alist-get 'conversation (alist-get 'processor config))) khoj-openai-api-key))
-      (message "khoj.el: Chat configuration has gone stale.")
-      (let* ((chat-directory (khoj--get-directory-from-config config '(processor conversation conversation-logfile)))
-             (model-name (khoj--get-directory-from-config config '(processor conversation model)))
-             (new-processor-type (alist-get 'processor config)))
-        (setq new-processor-type (delq (assoc 'conversation new-processor-type) new-processor-type))
-        (cl-pushnew `(conversation . ((conversation-logfile . ,(format "%s/conversation.json" chat-directory))
-                                      (model . ,model-name)
-                                      (openai-api-key . ,khoj-openai-api-key)))
-                    new-processor-type)
-        (setq config (delq (assoc 'processor config) config))
-        (cl-pushnew `(processor . ,new-processor-type) config))))
-
-      ;; Update server with latest configuration, if required
-      (cond ((not current-config)
-            (khoj--post-new-config config)
-            (message "khoj.el: ⚙️ Generated new khoj server configuration."))
-           ((not (equal config current-config))
-            (khoj--post-new-config config)
-            (message "khoj.el: ⚙️ Updated khoj server configuration.")))))
-
 (defun khoj-setup (&optional interact)
-  "Install, start and configure Khoj server. Get permission if INTERACT is non-nil."
+  "Install and start Khoj server. Get permission if INTERACT is non-nil."
   (interactive "p")
   ;; Setup khoj server if not running
   (let* ((not-started (not (khoj--server-started?)))
          (permitted (if (and not-started interact)
-                        (y-or-n-p "Could not connect to Khoj server. Should I install, start and configure it for you?")
+                        (y-or-n-p "Could not connect to Khoj server. Should I install, start it for you?")
                       t)))
     ;; If user permits setup of khoj server from khoj.el
     (when permitted
@@ -475,17 +395,97 @@ CONFIG is json obtained from Khoj config API."
         (khoj--server-setup))
 
       ;; Wait until server is ready
-      ;; As server can be started but not ready to use/configure
+      ;; As server can be started but not ready to use
       (while (not khoj--server-ready?)
-        (sit-for 0.5))
-
-      ;; Configure server once it's ready
-      (khoj--server-configure))))
+        (sit-for 0.5)))))
 
 
-;; -----------------------------------------------
-;; Extract and Render Entries of each Content Type
-;; -----------------------------------------------
+;; -------------------
+;; Khoj Index Content
+;; -------------------
+
+(defun khoj--server-index-files (&optional force content-type file-paths)
+  "Send files at `FILE-PATHS' to the Khoj server to index for search and chat.
+`FORCE' re-indexes all files of `CONTENT-TYPE' even if they are already indexed."
+  (interactive)
+  (let* ((boundary (format "-------------------------%d" (random (expt 10 10))))
+         ;; Use `khoj-index-directories', `khoj-index-files' when set, else fallback to `khoj-org-directories', `khoj-org-files'
+         ;; This is a temporary change. `khoj-org-directories', `khoj-org-files' are deprecated. They will be removed in a future release
+         (content-directories (or khoj-index-directories khoj-org-directories))
+         (content-files (or khoj-index-files khoj-org-files))
+         (files-to-index (or file-paths
+                             (append (mapcan (lambda (dir) (directory-files-recursively dir "\\.\\(org\\|md\\|markdown\\|pdf\\|txt\\|rst\\|xml\\|htm\\|html\\)$")) content-directories) content-files)))
+         (type-query (if (or (equal content-type "all") (not content-type)) "" (format "t=%s" content-type)))
+         (inhibit-message t)
+         (message-log-max nil))
+    (let ((url-request-method "POST")
+          (url-request-data (khoj--render-files-as-request-body files-to-index khoj--indexed-files boundary))
+          (url-request-extra-headers `(("content-type" . ,(format "multipart/form-data; boundary=%s" boundary))
+                                       ("Authorization" . ,(format "Bearer %s" khoj-api-key)))))
+      (with-current-buffer
+          (url-retrieve (format "%s/api/v1/index/update?%s&force=%s&client=emacs" khoj-server-url type-query (or force "false"))
+                        ;; render response from indexing API endpoint on server
+                        (lambda (status)
+                          (if (not status)
+                              (message "khoj.el: %scontent index %supdated" (if content-type (format "%s " content-type) "all ") (if force "force " ""))
+                            (progn
+                              (khoj--delete-open-network-connections-to-server)
+                              (with-current-buffer (current-buffer)
+                                (search-forward "\n\n" nil t)
+                                (message "khoj.el: Failed to %supdate %s content index. Status: %s%s"
+                                         (if force "force " "")
+                                         (if content-type (format "%s " content-type) "all")
+                                         (string-trim (format "%s %s" (nth 1 (nth 1 status)) (nth 2 (nth 1 status))))
+                                         (if (> (- (point-max) (point)) 0) (format ". Response: %s" (string-trim (buffer-substring-no-properties (point) (point-max)))) ""))))))
+                        nil t t)))
+    (setq khoj--indexed-files files-to-index)))
+
+(defun khoj--render-files-as-request-body (files-to-index previously-indexed-files boundary)
+  "Render `FILES-TO-INDEX', `PREVIOUSLY-INDEXED-FILES' as multi-part form body.
+Use `BOUNDARY' to separate files. This is sent to Khoj server as a POST request."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert "\n")
+    (dolist (file-to-index files-to-index)
+      ;; find file content-type. Choose from org, markdown, pdf, plaintext
+      (let ((content-type (cond ((string-match "\\.org$" file-to-index) "text/org")
+                                ((string-match "\\.\\(md\\|markdown\\)$" file-to-index) "text/markdown")
+                                ((string-match "\\.pdf$" file-to-index) "application/pdf")
+                                (t "text/plain"))))
+      (insert (format "--%s\r\n" boundary))
+      (insert (format "Content-Disposition: form-data; name=\"files\"; filename=\"%s\"\r\n" file-to-index))
+      (insert (format "Content-Type: %s\r\n\r\n" content-type))
+      (insert (with-temp-buffer
+                (insert-file-contents-literally file-to-index)
+                (buffer-string)))
+      (insert "\r\n")))
+    (dolist (file-to-index previously-indexed-files)
+      (when (not (member file-to-index files-to-index))
+        ;; find file content-type. Choose from org, markdown, pdf, plaintext
+        (let ((content-type (cond ((string-match "\\.org$" file-to-index) "text/org")
+                                  ((string-match "\\.\\(md\\|markdown\\)$" file-to-index) "text/markdown")
+                                  ((string-match "\\.pdf$" file-to-index) "application/pdf")
+                                  (t "text/plain"))))
+          (insert (format "--%s\r\n" boundary))
+          (insert (format "Content-Disposition: form-data; name=\"files\"; filename=\"%s\"\r\n" file-to-index))
+          (insert "Content-Type: text/org\r\n\r\n")
+          (insert "")
+          (insert "\r\n"))))
+    (insert (format "--%s--\r\n" boundary))
+    (buffer-string)))
+
+;; Cancel any running indexing timer, first
+(when khoj--index-timer
+    (cancel-timer khoj--index-timer))
+;; Send files to index on server every `khoj-index-interval' seconds
+(when khoj-auto-index
+  (setq khoj--index-timer
+        (run-with-timer 60 khoj-index-interval 'khoj--server-index-files)))
+
+
+;; -------------------------------------------
+;; Render Response from Khoj server for Emacs
+;; -------------------------------------------
 
 (defun khoj--extract-entries-as-markdown (json-response query)
   "Convert JSON-RESPONSE, QUERY from API to markdown entries."
@@ -595,7 +595,7 @@ CONFIG is json obtained from Khoj config API."
         (file-extension (file-name-extension buffer-name)))
     (cond
      ((and (member 'org enabled-content-types) (equal file-extension "org")) "org")
-     ((and (member 'org enabled-content-types) (equal file-extension "pdf")) "pdf")
+     ((and (member 'pdf enabled-content-types) (equal file-extension "pdf")) "pdf")
      ((and (member 'markdown enabled-content-types) (or (equal file-extension "markdown") (equal file-extension "md"))) "markdown")
      (t khoj-default-content-type))))
 
@@ -608,19 +608,22 @@ CONFIG is json obtained from Khoj config API."
   "Configure khoj server with provided CONFIG."
   ;; POST provided config to khoj server
   (let ((url-request-method "POST")
-        (url-request-extra-headers '(("Content-Type" . "application/json")))
-        (url-request-data (json-encode-alist config))
+        (url-request-extra-headers `(("Content-Type" . "application/json")
+                                     ("Authorization" . ,(format "Bearer %s" khoj-api-key))))
+        (url-request-data (encode-coding-string (json-encode-alist config) 'utf-8))
         (config-url (format "%s/api/config/data" khoj-server-url)))
     (with-current-buffer (url-retrieve-synchronously config-url)
       (buffer-string)))
   ;; Update index on khoj server after configuration update
-  (let ((khoj--server-ready? nil))
-    (url-retrieve (format "%s/api/update?t=org&client=emacs" khoj-server-url) #'identity)))
+  (let ((khoj--server-ready? nil)
+        (url-request-extra-headers `(("Authorization" . ,(format "\"Bearer %s\"" khoj-api-key)))))
+    (url-retrieve (format "%s/api/update?client=emacs" khoj-server-url) #'identity)))
 
 (defun khoj--get-enabled-content-types ()
   "Get content types enabled for search from API."
   (let ((config-url (format "%s/api/config/types" khoj-server-url))
-        (url-request-method "GET"))
+        (url-request-method "GET")
+        (url-request-extra-headers `(("Authorization" . ,(format "Bearer %s" khoj-api-key)))))
     (with-temp-buffer
       (url-insert-file-contents config-url)
       (thread-last
@@ -640,7 +643,8 @@ Render results in BUFFER-NAME using QUERY, CONTENT-TYPE."
   ;; get json response from api
   (with-current-buffer buffer-name
     (let ((inhibit-read-only t)
-          (url-request-method "GET"))
+          (url-request-method "GET")
+          (url-request-extra-headers `(("Authorization" . ,(format "Bearer %s" khoj-api-key)))))
       (erase-buffer)
       (url-insert-file-contents query-url)))
   ;; render json response into formatted entries
@@ -766,6 +770,7 @@ Render results in BUFFER-NAME using QUERY, CONTENT-TYPE."
   "Send QUERY to Khoj Chat API."
   (let* ((url-request-method "GET")
          (encoded-query (url-hexify-string query))
+         (url-request-extra-headers `(("Authorization" . ,(format "Bearer %s" khoj-api-key))))
          (query-url (format "%s/api/chat?q=%s&n=%s&client=emacs" khoj-server-url encoded-query khoj-results-count)))
     (with-temp-buffer
       (condition-case ex
@@ -780,6 +785,7 @@ Render results in BUFFER-NAME using QUERY, CONTENT-TYPE."
 (defun khoj--get-chat-history-api ()
   "Send QUERY to Khoj Chat History API."
   (let* ((url-request-method "GET")
+         (url-request-extra-headers `(("Authorization" . ,(format "Bearer %s" khoj-api-key))))
          (query-url (format "%s/api/chat/history?client=emacs" khoj-server-url)))
     (with-temp-buffer
       (condition-case ex
@@ -887,13 +893,16 @@ RECEIVE-DATE is the message receive date."
     (let ((proc-buf (buffer-name (process-buffer proc)))
           (khoj-network-proc-buf (string-join (split-string khoj-server-url "://") " ")))
       (when (string-match (format "%s" khoj-network-proc-buf) proc-buf)
-        (delete-process proc)))))
+        (ignore-errors (delete-process proc))))))
 
 (defun khoj--teardown-incremental-search ()
   "Teardown hooks used for incremental search."
   (message "khoj.el: Teardown Incremental Search")
   ;; unset khoj minibuffer window
   (setq khoj--minibuffer-window nil)
+  (when (and khoj--search-on-idle-timer
+             (timerp khoj--search-on-idle-timer))
+    (cancel-timer khoj--search-on-idle-timer))
   ;; delete open connections to khoj server
   (khoj--delete-open-network-connections-to-server)
   ;; remove hooks for khoj incremental query and self
@@ -916,8 +925,10 @@ RECEIVE-DATE is the message receive date."
           ;; set current (mini-)buffer entered as khoj minibuffer
           ;; used to query khoj API only when user in khoj minibuffer
           (setq khoj--minibuffer-window (current-buffer))
-          (add-hook 'post-command-hook #'khoj--incremental-search) ; do khoj incremental search after every user action
-          (add-hook 'minibuffer-exit-hook #'khoj--teardown-incremental-search)) ; teardown khoj incremental search on minibuffer exit
+          ; do khoj incremental search after idle time
+          (setq khoj--search-on-idle-timer (run-with-idle-timer khoj-search-on-idle-time t #'khoj--incremental-search))
+          ; teardown khoj incremental search on minibuffer exit
+          (add-hook 'minibuffer-exit-hook #'khoj--teardown-incremental-search))
       (read-string khoj--query-prompt))))
 
 
@@ -988,17 +999,20 @@ Paragraph only starts at first text after blank line."
 ;; Khoj Menu
 ;; ---------
 
-(transient-define-argument khoj--content-type-switch ()
-  :class 'transient-switches
-  :argument-format "--content-type=%s"
-  :argument-regexp ".+"
-  ;; set content type to: last used > based on current buffer > default type
-  :init-value (lambda (obj) (oset obj value (format "--content-type=%s" (or khoj--content-type (khoj--buffer-name-to-content-type (buffer-name))))))
-  ;; dynamically set choices to content types enabled on khoj backend
-  :choices (or (ignore-errors (mapcar #'symbol-name (khoj--get-enabled-content-types))) '("all" "org" "markdown" "pdf" "image")))
+(defun khoj--setup-and-show-menu ()
+  "Create Transient menu for khoj and show it."
+  ;; Create the Khoj Transient menu
+  (transient-define-argument khoj--content-type-switch ()
+    :class 'transient-switches
+    :argument-format "--content-type=%s"
+    :argument-regexp ".+"
+    ;; set content type to: last used > based on current buffer > default type
+    :init-value (lambda (obj) (oset obj value (format "--content-type=%s" (or khoj--content-type (khoj--buffer-name-to-content-type (buffer-name))))))
+    ;; dynamically set choices to content types enabled on khoj backend
+    :choices (or (ignore-errors (mapcar #'symbol-name (khoj--get-enabled-content-types))) '("all" "org" "markdown" "pdf" "image")))
 
-(transient-define-suffix khoj--search-command (&optional args)
-  (interactive (list (transient-args transient-current-command)))
+  (transient-define-suffix khoj--search-command (&optional args)
+    (interactive (list (transient-args transient-current-command)))
     (progn
       ;; set content type to: specified > last used > based on current buffer > default type
       (setq khoj--content-type (or (transient-arg-value "--content-type=" args) (khoj--buffer-name-to-content-type (buffer-name))))
@@ -1007,9 +1021,9 @@ Paragraph only starts at first text after blank line."
       ;; trigger incremental search
       (call-interactively #'khoj-incremental)))
 
-(transient-define-suffix khoj--find-similar-command (&optional args)
-  "Find items similar to current item at point."
-  (interactive (list (transient-args transient-current-command)))
+  (transient-define-suffix khoj--find-similar-command (&optional args)
+    "Find items similar to current item at point."
+    (interactive (list (transient-args transient-current-command)))
     (progn
       ;; set content type to: specified > last used > based on current buffer > default type
       (setq khoj--content-type (or (transient-arg-value "--content-type=" args) (khoj--buffer-name-to-content-type (buffer-name))))
@@ -1017,36 +1031,38 @@ Paragraph only starts at first text after blank line."
       (setq khoj-results-count (or (transient-arg-value "--results-count=" args) khoj-results-count))
       (khoj--find-similar khoj--content-type)))
 
-(transient-define-suffix khoj--update-command (&optional args)
-  "Call khoj API to update index of specified content type."
-  (interactive (list (transient-args transient-current-command)))
-  (let* ((force-update (if (member "--force-update" args) "true" "false"))
-         ;; set content type to: specified > last used > based on current buffer > default type
-         (content-type (or (transient-arg-value "--content-type=" args) (khoj--buffer-name-to-content-type (buffer-name))))
-         (update-url (format "%s/api/update?t=%s&force=%s&client=emacs" khoj-server-url content-type force-update))
-         (url-request-method "GET"))
-    (progn
-      (setq khoj--content-type content-type)
-      (url-retrieve update-url (lambda (_) (message "khoj.el: %s index %supdated!" content-type (if (member "--force-update" args) "force " "")))))))
+  (transient-define-suffix khoj--update-command (&optional args)
+    "Call khoj API to update index of specified content type."
+    (interactive (list (transient-args transient-current-command)))
+    (let* ((force-update (if (member "--force-update" args) "true" "false"))
+           ;; set content type to: specified > last used > based on current buffer > default type
+           (content-type (or (transient-arg-value "--content-type=" args) (khoj--buffer-name-to-content-type (buffer-name))))
+           (url-request-method "GET"))
+      (progn
+        (setq khoj--content-type content-type)
+        (khoj--server-index-files force-update content-type))))
 
-(transient-define-suffix khoj--chat-command (&optional _)
-  "Command to Chat with Khoj."
-  (interactive (list (transient-args transient-current-command)))
-  (khoj--chat))
+  (transient-define-suffix khoj--chat-command (&optional _)
+    "Command to Chat with Khoj."
+    (interactive (list (transient-args transient-current-command)))
+    (khoj--chat))
 
-(transient-define-prefix khoj--menu ()
-  "Create Khoj Menu to Configure and Execute Commands."
-  [["Configure Search"
-    ("n" "Results Count" "--results-count=" :init-value (lambda (obj) (oset obj value (format "%s" khoj-results-count))))
-    ("t" "Content Type" khoj--content-type-switch)]
-   ["Configure Update"
-    ("-f" "Force Update" "--force-update")]]
-  [["Act"
-    ("c" "Chat" khoj--chat-command)
-    ("s" "Search" khoj--search-command)
-    ("f" "Find Similar" khoj--find-similar-command)
-    ("u" "Update" khoj--update-command)
-    ("q" "Quit" transient-quit-one)]])
+  (transient-define-prefix khoj--menu ()
+    "Create Khoj Menu to Configure and Execute Commands."
+    [["Configure Search"
+      ("n" "Results Count" "--results-count=" :init-value (lambda (obj) (oset obj value (format "%s" khoj-results-count))))
+      ("t" "Content Type" khoj--content-type-switch)]
+     ["Configure Update"
+      ("-f" "Force Update" "--force-update")]]
+    [["Act"
+      ("c" "Chat" khoj--chat-command)
+      ("s" "Search" khoj--search-command)
+      ("f" "Find Similar" khoj--find-similar-command)
+      ("u" "Update" khoj--update-command)
+      ("q" "Quit" transient-quit-one)]])
+
+  ;; Show the Khoj Transient menu
+  (khoj--menu))
 
 
 ;; ----------
@@ -1059,7 +1075,7 @@ Paragraph only starts at first text after blank line."
   (interactive)
   (when khoj-auto-setup
     (khoj-setup t))
-  (khoj--menu))
+  (khoj--setup-and-show-menu))
 
 (provide 'khoj)
 

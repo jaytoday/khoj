@@ -1,262 +1,234 @@
-# Standard Packages
-import sys
-import logging
 import json
+import logging
+import os
 from enum import Enum
 from typing import Optional
+
+import openai
 import requests
-
-# External Packages
 import schedule
-from fastapi.staticfiles import StaticFiles
+from starlette.authentication import (
+    AuthCredentials,
+    AuthenticationBackend,
+    SimpleUser,
+    UnauthenticatedUser,
+)
+from starlette.middleware.authentication import AuthenticationMiddleware
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.requests import HTTPConnection
 
-# Internal Packages
-from khoj.processor.conversation.gpt import summarize
-from khoj.processor.jsonl.jsonl_to_jsonl import JsonlToJsonl
-from khoj.processor.markdown.markdown_to_jsonl import MarkdownToJsonl
-from khoj.processor.org_mode.org_to_jsonl import OrgToJsonl
-from khoj.processor.pdf.pdf_to_jsonl import PdfToJsonl
-from khoj.processor.github.github_to_jsonl import GithubToJsonl
-from khoj.processor.notion.notion_to_jsonl import NotionToJsonl
-from khoj.search_type import image_search, text_search
+from khoj.database.adapters import (
+    ConversationAdapters,
+    SubscriptionState,
+    aget_user_subscription_state,
+    get_all_users,
+    get_or_create_search_models,
+)
+from khoj.database.models import KhojUser, Subscription
+from khoj.processor.embeddings import CrossEncoderModel, EmbeddingsModel
+from khoj.routers.indexer import configure_content, configure_search, load_content
 from khoj.utils import constants, state
-from khoj.utils.config import SearchType, SearchModels, ProcessorConfigModel, ConversationProcessorConfigModel
-from khoj.utils.helpers import LRU, resolve_absolute_path, merge_dicts
-from khoj.utils.rawconfig import FullConfig, ProcessorConfig
-from khoj.search_filter.date_filter import DateFilter
-from khoj.search_filter.word_filter import WordFilter
-from khoj.search_filter.file_filter import FileFilter
-
+from khoj.utils.config import SearchType
+from khoj.utils.fs_syncer import collect_files
+from khoj.utils.rawconfig import FullConfig
 
 logger = logging.getLogger(__name__)
 
 
-def configure_server(args, required=False):
-    if args.config is None:
-        if required:
-            logger.error(
-                f"Exiting as Khoj is not configured.\nConfigure it via http://localhost:42110/config or by editing {state.config_file}."
-            )
-            sys.exit(1)
-        else:
-            logger.warning(
-                f"Khoj is not configured.\nConfigure it via http://localhost:42110/config, plugins or by editing {state.config_file}."
-            )
-            return
-    else:
-        state.config = args.config
+class AuthenticatedKhojUser(SimpleUser):
+    def __init__(self, user):
+        self.object = user
+        super().__init__(user.email)
 
-    # Initialize Processor from Config
-    state.processor_config = configure_processor(args.config.processor)
 
-    # Initialize the search type and model from Config
-    state.search_index_lock.acquire()
-    state.SearchType = configure_search_types(state.config)
-    state.model = configure_search(state.model, state.config, args.regenerate)
-    state.search_index_lock.release()
+class UserAuthenticationBackend(AuthenticationBackend):
+    def __init__(
+        self,
+    ):
+        from khoj.database.models import KhojApiUser, KhojUser
+
+        self.khojuser_manager = KhojUser.objects
+        self.khojapiuser_manager = KhojApiUser.objects
+        self._initialize_default_user()
+        super().__init__()
+
+    def _initialize_default_user(self):
+        if not self.khojuser_manager.filter(username="default").exists():
+            default_user = self.khojuser_manager.create_user(
+                username="default",
+                email="default@example.com",
+                password="default",
+            )
+            Subscription.objects.create(user=default_user, type="standard", renewal_date="2100-04-01")
+
+    async def authenticate(self, request: HTTPConnection):
+        current_user = request.session.get("user")
+        if current_user and current_user.get("email"):
+            user = (
+                await self.khojuser_manager.filter(email=current_user.get("email"))
+                .prefetch_related("subscription")
+                .afirst()
+            )
+            if user:
+                if not state.billing_enabled:
+                    return AuthCredentials(["authenticated", "premium"]), AuthenticatedKhojUser(user)
+
+                subscription_state = await aget_user_subscription_state(user)
+                subscribed = (
+                    subscription_state == SubscriptionState.SUBSCRIBED.value
+                    or subscription_state == SubscriptionState.TRIAL.value
+                    or subscription_state == SubscriptionState.UNSUBSCRIBED.value
+                )
+                if subscribed:
+                    return AuthCredentials(["authenticated", "premium"]), AuthenticatedKhojUser(user)
+                return AuthCredentials(["authenticated"]), AuthenticatedKhojUser(user)
+        if len(request.headers.get("Authorization", "").split("Bearer ")) == 2:
+            # Get bearer token from header
+            bearer_token = request.headers["Authorization"].split("Bearer ")[1]
+            # Get user owning token
+            user_with_token = (
+                await self.khojapiuser_manager.filter(token=bearer_token)
+                .select_related("user")
+                .prefetch_related("user__subscription")
+                .afirst()
+            )
+            if user_with_token:
+                if not state.billing_enabled:
+                    return AuthCredentials(["authenticated", "premium"]), AuthenticatedKhojUser(user_with_token.user)
+
+                subscription_state = await aget_user_subscription_state(user_with_token.user)
+                subscribed = (
+                    subscription_state == SubscriptionState.SUBSCRIBED.value
+                    or subscription_state == SubscriptionState.TRIAL.value
+                    or subscription_state == SubscriptionState.UNSUBSCRIBED.value
+                )
+                if subscribed:
+                    return AuthCredentials(["authenticated", "premium"]), AuthenticatedKhojUser(user_with_token.user)
+                return AuthCredentials(["authenticated"]), AuthenticatedKhojUser(user_with_token.user)
+        if state.anonymous_mode:
+            user = await self.khojuser_manager.filter(username="default").prefetch_related("subscription").afirst()
+            if user:
+                return AuthCredentials(["authenticated", "premium"]), AuthenticatedKhojUser(user)
+
+        return AuthCredentials(), UnauthenticatedUser()
+
+
+def initialize_server(config: Optional[FullConfig]):
+    try:
+        configure_server(config, init=True)
+    except Exception as e:
+        logger.error(f"🚨 Failed to configure server on app load: {e}", exc_info=True)
+
+
+def configure_server(
+    config: FullConfig,
+    regenerate: bool = False,
+    search_type: Optional[SearchType] = None,
+    init=False,
+    user: KhojUser = None,
+):
+    # Update Config
+    if config == None:
+        logger.info(f"🚨 Khoj is not configured.\nInitializing it with a default config.")
+        config = FullConfig()
+    state.config = config
+
+    if ConversationAdapters.has_valid_openai_conversation_config():
+        openai_config = ConversationAdapters.get_openai_conversation_config()
+        state.openai_client = openai.OpenAI(api_key=openai_config.api_key)
+
+    # Initialize Search Models from Config and initialize content
+    try:
+        search_models = get_or_create_search_models()
+        state.embeddings_model = dict()
+        state.cross_encoder_model = dict()
+
+        for model in search_models:
+            state.embeddings_model.update({model.name: EmbeddingsModel(model.bi_encoder)})
+            state.cross_encoder_model.update({model.name: CrossEncoderModel(model.cross_encoder)})
+
+        state.SearchType = configure_search_types()
+        state.search_models = configure_search(state.search_models, state.config.search_type)
+        initialize_content(regenerate, search_type, init, user)
+    except Exception as e:
+        raise e
+
+
+def initialize_content(regenerate: bool, search_type: Optional[SearchType] = None, init=False, user: KhojUser = None):
+    # Initialize Content from Config
+    if state.search_models:
+        try:
+            if init:
+                logger.info("📬 Initializing content index...")
+                state.content_index = load_content(state.config.content_type, state.content_index, state.search_models)
+            else:
+                logger.info("📬 Updating content index...")
+                all_files = collect_files(user=user)
+                state.content_index, status = configure_content(
+                    state.content_index,
+                    state.config.content_type,
+                    all_files,
+                    state.search_models,
+                    regenerate,
+                    search_type,
+                    user=user,
+                )
+                if not status:
+                    raise RuntimeError("Failed to update content index")
+        except Exception as e:
+            raise e
 
 
 def configure_routes(app):
     # Import APIs here to setup search types before while configuring server
     from khoj.routers.api import api
     from khoj.routers.api_beta import api_beta
+    from khoj.routers.auth import auth_router
+    from khoj.routers.indexer import indexer
+    from khoj.routers.subscription import subscription_router
     from khoj.routers.web_client import web_client
 
-    app.mount("/static", StaticFiles(directory=constants.web_directory), name="static")
     app.include_router(api, prefix="/api")
     app.include_router(api_beta, prefix="/api/beta")
+    app.include_router(indexer, prefix="/api/v1/index")
+    if state.billing_enabled:
+        logger.info("💳 Enabled Billing")
+        app.include_router(subscription_router, prefix="/api/subscription")
     app.include_router(web_client)
+    app.include_router(auth_router, prefix="/auth")
 
 
-if not state.demo:
-
-    @schedule.repeat(schedule.every(61).minutes)
-    def update_search_index():
-        state.search_index_lock.acquire()
-        state.model = configure_search(state.model, state.config, regenerate=False)
-        state.search_index_lock.release()
-        logger.info("📬 Search index updated via Scheduler")
+def configure_middleware(app):
+    app.add_middleware(AuthenticationMiddleware, backend=UserAuthenticationBackend())
+    app.add_middleware(SessionMiddleware, secret_key=os.environ.get("KHOJ_DJANGO_SECRET_KEY", "!secret"))
 
 
-def configure_search_types(config: FullConfig):
+@schedule.repeat(schedule.every(61).minutes)
+def update_search_index():
+    try:
+        logger.info("📬 Updating content index via Scheduler")
+        for user in get_all_users():
+            all_files = collect_files(user=user)
+            state.content_index, success = configure_content(
+                state.content_index, state.config.content_type, all_files, state.search_models, user=user
+            )
+        all_files = collect_files(user=None)
+        state.content_index, success = configure_content(
+            state.content_index, state.config.content_type, all_files, state.search_models, user=None
+        )
+        if not success:
+            raise RuntimeError("Failed to update content index")
+        logger.info("📪 Content index updated via Scheduler")
+    except Exception as e:
+        logger.error(f"🚨 Error updating content index via Scheduler: {e}", exc_info=True)
+
+
+def configure_search_types():
     # Extract core search types
     core_search_types = {e.name: e.value for e in SearchType}
-    # Extract configured plugin search types
-    plugin_search_types = {}
-    if config.content_type and config.content_type.plugins:
-        plugin_search_types = {plugin_type: plugin_type for plugin_type in config.content_type.plugins.keys()}
 
     # Dynamically generate search type enum by merging core search types with configured plugin search types
-    return Enum("SearchType", merge_dicts(core_search_types, plugin_search_types))
-
-
-def configure_search(model: SearchModels, config: FullConfig, regenerate: bool, t: Optional[state.SearchType] = None):
-    if config is None or config.content_type is None or config.search_type is None:
-        logger.warning("🚨 No Content or Search type is configured.")
-        return
-
-    if model is None:
-        model = SearchModels()
-
-    try:
-        # Initialize Org Notes Search
-        if (t == state.SearchType.Org or t == None) and config.content_type.org and config.search_type.asymmetric:
-            logger.info("🦄 Setting up search for orgmode notes")
-            # Extract Entries, Generate Notes Embeddings
-            model.org_search = text_search.setup(
-                OrgToJsonl,
-                config.content_type.org,
-                search_config=config.search_type.asymmetric,
-                regenerate=regenerate,
-                filters=[DateFilter(), WordFilter(), FileFilter()],
-            )
-
-        # Initialize Markdown Search
-        if (
-            (t == state.SearchType.Markdown or t == None)
-            and config.content_type.markdown
-            and config.search_type.asymmetric
-        ):
-            logger.info("💎 Setting up search for markdown notes")
-            # Extract Entries, Generate Markdown Embeddings
-            model.markdown_search = text_search.setup(
-                MarkdownToJsonl,
-                config.content_type.markdown,
-                search_config=config.search_type.asymmetric,
-                regenerate=regenerate,
-                filters=[DateFilter(), WordFilter(), FileFilter()],
-            )
-
-        # Initialize PDF Search
-        if (t == state.SearchType.Pdf or t == None) and config.content_type.pdf and config.search_type.asymmetric:
-            logger.info("🖨️ Setting up search for pdf")
-            # Extract Entries, Generate PDF Embeddings
-            model.pdf_search = text_search.setup(
-                PdfToJsonl,
-                config.content_type.pdf,
-                search_config=config.search_type.asymmetric,
-                regenerate=regenerate,
-                filters=[DateFilter(), WordFilter(), FileFilter()],
-            )
-
-        # Initialize Image Search
-        if (t == state.SearchType.Image or t == None) and config.content_type.image and config.search_type.image:
-            logger.info("🌄 Setting up search for images")
-            # Extract Entries, Generate Image Embeddings
-            model.image_search = image_search.setup(
-                config.content_type.image, search_config=config.search_type.image, regenerate=regenerate
-            )
-
-        if (t == state.SearchType.Github or t == None) and config.content_type.github and config.search_type.asymmetric:
-            logger.info("🐙 Setting up search for github")
-            # Extract Entries, Generate Github Embeddings
-            model.github_search = text_search.setup(
-                GithubToJsonl,
-                config.content_type.github,
-                search_config=config.search_type.asymmetric,
-                regenerate=regenerate,
-                filters=[DateFilter(), WordFilter(), FileFilter()],
-            )
-
-        # Initialize External Plugin Search
-        if (t == None or t in state.SearchType) and config.content_type.plugins:
-            logger.info("🔌 Setting up search for plugins")
-            model.plugin_search = {}
-            for plugin_type, plugin_config in config.content_type.plugins.items():
-                model.plugin_search[plugin_type] = text_search.setup(
-                    JsonlToJsonl,
-                    plugin_config,
-                    search_config=config.search_type.asymmetric,
-                    regenerate=regenerate,
-                    filters=[DateFilter(), WordFilter(), FileFilter()],
-                )
-
-        # Initialize Notion Search
-        if (t == None or t in state.SearchType) and config.content_type.notion:
-            logger.info("🔌 Setting up search for notion")
-            model.notion_search = text_search.setup(
-                NotionToJsonl,
-                config.content_type.notion,
-                search_config=config.search_type.asymmetric,
-                regenerate=regenerate,
-                filters=[DateFilter(), WordFilter(), FileFilter()],
-            )
-
-    except Exception as e:
-        logger.error("🚨 Failed to setup search")
-        raise e
-
-    # Invalidate Query Cache
-    state.query_cache = LRU()
-
-    return model
-
-
-def configure_processor(processor_config: ProcessorConfig):
-    if not processor_config:
-        return
-
-    processor = ProcessorConfigModel()
-
-    # Initialize Conversation Processor
-    if processor_config.conversation:
-        logger.info("💬 Setting up conversation processor")
-        processor.conversation = configure_conversation_processor(processor_config.conversation)
-
-    return processor
-
-
-def configure_conversation_processor(conversation_processor_config):
-    conversation_processor = ConversationProcessorConfigModel(conversation_processor_config)
-    conversation_logfile = resolve_absolute_path(conversation_processor.conversation_logfile)
-
-    if conversation_logfile.is_file():
-        # Load Metadata Logs from Conversation Logfile
-        with conversation_logfile.open("r") as f:
-            conversation_processor.meta_log = json.load(f)
-        logger.debug(f"Loaded conversation logs from {conversation_logfile}")
-    else:
-        # Initialize Conversation Logs
-        conversation_processor.meta_log = {}
-        conversation_processor.chat_session = []
-
-    return conversation_processor
-
-
-@schedule.repeat(schedule.every(17).minutes)
-def save_chat_session():
-    # No need to create empty log file
-    if not (
-        state.processor_config
-        and state.processor_config.conversation
-        and state.processor_config.conversation.meta_log
-        and state.processor_config.conversation.chat_session
-    ):
-        return
-
-    # Summarize Conversation Logs for this Session
-    chat_session = state.processor_config.conversation.chat_session
-    openai_api_key = state.processor_config.conversation.openai_api_key
-    conversation_log = state.processor_config.conversation.meta_log
-    chat_model = state.processor_config.conversation.chat_model
-    session = {
-        "summary": summarize(chat_session, model=chat_model, api_key=openai_api_key),
-        "session-start": conversation_log.get("session", [{"session-end": 0}])[-1]["session-end"],
-        "session-end": len(conversation_log["chat"]),
-    }
-    if "session" in conversation_log:
-        conversation_log["session"].append(session)
-    else:
-        conversation_log["session"] = [session]
-
-    # Save Conversation Metadata Logs to Disk
-    conversation_logfile = resolve_absolute_path(state.processor_config.conversation.conversation_logfile)
-    conversation_logfile.parent.mkdir(parents=True, exist_ok=True)  # create conversation directory if doesn't exist
-    with open(conversation_logfile, "w+", encoding="utf-8") as logfile:
-        json.dump(conversation_log, logfile, indent=2)
-
-    state.processor_config.conversation.chat_session = []
-    logger.info("📩 Saved current chat session to conversation logs")
+    return Enum("SearchType", core_search_types)
 
 
 @schedule.repeat(schedule.every(59).minutes)
@@ -277,6 +249,6 @@ def upload_telemetry():
                     log[field] = str(log[field])
         requests.post(constants.telemetry_server, json=state.telemetry)
     except Exception as e:
-        logger.error(f"📡 Error uploading telemetry: {e}")
+        logger.error(f"📡 Error uploading telemetry: {e}", exc_info=True)
     else:
         state.telemetry = []

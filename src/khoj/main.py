@@ -1,41 +1,79 @@
-# Standard Packages
-import os
-import signal
-import sys
+""" Main module for Khoj Assistant
+   isort:skip_file
+"""
 
-if sys.stdout is None:
-    sys.stdout = open(os.devnull, "w")
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, "w")
+
+from contextlib import redirect_stdout
+import io
+import os
+import sys
+import locale
 
 import logging
 import threading
 import warnings
-from platform import system
-import webbrowser
+from importlib.metadata import version
 
 # Ignore non-actionable warnings
 warnings.filterwarnings("ignore", message=r"snapshot_download.py has been made private", category=FutureWarning)
 warnings.filterwarnings("ignore", message=r"legacy way to download files from the HF hub,", category=FutureWarning)
 
-# External Packages
+
 import uvicorn
+import django
 from fastapi import FastAPI
-from PyQt6 import QtWidgets
-from PyQt6.QtCore import QThread, QTimer
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from rich.logging import RichHandler
 import schedule
 
-# Internal Packages
-from khoj.configure import configure_routes, configure_server
-from khoj.utils import state
-from khoj.utils.cli import cli
-from khoj.interface.desktop.main_window import MainWindow
-from khoj.interface.desktop.system_tray import create_system_tray
+from django.core.asgi import get_asgi_application
+from django.core.management import call_command
 
+# Initialize Django
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "khoj.app.settings")
+django.setup()
+
+# Initialize Django Database
+db_migrate_output = io.StringIO()
+with redirect_stdout(db_migrate_output):
+    call_command("migrate", "--noinput")
+
+# Initialize Django Static Files
+collectstatic_output = io.StringIO()
+with redirect_stdout(collectstatic_output):
+    call_command("collectstatic", "--noinput")
 
 # Initialize the Application Server
 app = FastAPI()
+
+# Get Django Application
+django_app = get_asgi_application()
+
+# Add CORS middleware
+KHOJ_DOMAIN = os.getenv("KHOJ_DOMAIN", "app.khoj.dev")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "app://obsidian.md",
+        "http://localhost:*",
+        "http://127.0.0.1:*",
+        f"https://{KHOJ_DOMAIN}",
+        "app://khoj.dev",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Set Locale
+locale.setlocale(locale.LC_ALL, "")
+
+# We import these packages after setting up Django so that Django features are accessible to the app.
+from khoj.configure import configure_routes, initialize_server, configure_middleware
+from khoj.utils import state
+from khoj.utils.cli import cli
+from khoj.utils.initialization import initialization
 
 # Setup Logger
 rich_handler = RichHandler(rich_tracebacks=True)
@@ -45,7 +83,7 @@ logging.basicConfig(handlers=[rich_handler])
 logger = logging.getLogger("khoj")
 
 
-def run():
+def run(should_start_server=True):
     # Turn Tokenizers Parallelism Off. App does not support it.
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -54,14 +92,20 @@ def run():
     args = cli(state.cli_args)
     set_state(args)
 
-    # Create app directory, if it doesn't exist
-    state.config_file.parent.mkdir(parents=True, exist_ok=True)
-
     # Set Logging Level
     if args.verbose == 0:
         logger.setLevel(logging.INFO)
     elif args.verbose >= 1:
         logger.setLevel(logging.DEBUG)
+
+    logger.info(f"🚒 Initializing Khoj v{state.khoj_version}")
+    logger.info(f"📦 Initializing DB:\n{db_migrate_output.getvalue().strip()}")
+    logger.debug(f"🌍 Initializing Web Client:\n{collectstatic_output.getvalue().strip()}")
+
+    initialization()
+
+    # Create app directory, if it doesn't exist
+    state.config_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Set Log File
     fh = logging.FileHandler(state.config_file.parent / "khoj.log", encoding="utf-8")
@@ -70,73 +114,27 @@ def run():
 
     logger.info("🌘 Starting Khoj")
 
-    if not args.gui:
-        # Setup task scheduler
-        poll_task_scheduler()
+    # Setup task scheduler
+    poll_task_scheduler()
 
-        # Start Server
-        configure_server(args, required=False)
-        configure_routes(app)
+    # Start Server
+    configure_routes(app)
+
+    #  Mount Django and Static Files
+    app.mount("/server", django_app, name="server")
+    static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+    if not os.path.exists(static_dir):
+        os.mkdir(static_dir)
+    app.mount(f"/static", StaticFiles(directory=static_dir), name=static_dir)
+
+    # Configure Middleware
+    configure_middleware(app)
+
+    initialize_server(args.config)
+
+    # If the server is started through gunicorn (external to the script), don't start the server
+    if should_start_server:
         start_server(app, host=args.host, port=args.port, socket=args.socket)
-    else:
-        # Setup GUI
-        gui = QtWidgets.QApplication([])
-        main_window = MainWindow(args.host, args.port)
-
-        # System tray is only available on Windows, MacOS.
-        # On Linux (Gnome) the System tray is not supported.
-        # Since only the Main Window is available
-        # Quitting it should quit the application
-        if system() in ["Windows", "Darwin"]:
-            gui.setQuitOnLastWindowClosed(False)
-            tray = create_system_tray(gui, main_window)
-            tray.show()
-
-        # Setup Server
-        configure_server(args, required=False)
-        configure_routes(app)
-        server = ServerThread(app, args.host, args.port, args.socket)
-
-        url = f"http://{args.host}:{args.port}"
-        logger.info(f"🌗 Khoj is running at {url}")
-        try:
-            startup_url = url if args.config else f"{url}/config"
-            webbrowser.open(startup_url)
-        except:
-            logger.warning(f"🚧 Unable to open browser. Please open {url} manually to configure or use Khoj.")
-
-        # Show Main Window on First Run Experience or if on Linux
-        if args.config is None or system() not in ["Windows", "Darwin"]:
-            main_window.show()
-
-        # Setup Signal Handlers
-        signal.signal(signal.SIGINT, sigint_handler)
-        # Invoke Python interpreter every 500ms to handle signals, run scheduled tasks
-        timer = QTimer()
-        timer.start(500)
-        timer.timeout.connect(schedule.run_pending)
-
-        # Start Application
-        server.start()
-        gui.aboutToQuit.connect(server.terminate)
-
-        # Close Splash Screen if still open
-        if system() != "Darwin":
-            try:
-                import pyi_splash
-
-                # Update the text on the splash screen
-                pyi_splash.update_text("Khoj setup complete")
-                # Close Splash Screen
-                pyi_splash.close()
-            except:
-                pass
-
-        gui.exec()
-
-
-def sigint_handler(*args):
-    QtWidgets.QApplication.quit()
 
 
 def set_state(args):
@@ -145,7 +143,9 @@ def set_state(args):
     state.verbose = args.verbose
     state.host = args.host
     state.port = args.port
-    state.demo = args.demo
+    state.anonymous_mode = args.anonymous_mode
+    state.khoj_version = version("khoj-assistant")
+    state.chat_on_gpu = args.chat_on_gpu
 
 
 def start_server(app, host=None, port=None, socket=None):
@@ -164,25 +164,7 @@ def poll_task_scheduler():
     schedule.run_pending()
 
 
-class ServerThread(QThread):
-    def __init__(self, app, host=None, port=None, socket=None):
-        super(ServerThread, self).__init__()
-        self.app = app
-        self.host = host
-        self.port = port
-        self.socket = socket
-
-    def __del__(self):
-        self.wait()
-
-    def run(self):
-        start_server(self.app, self.host, self.port, self.socket)
-
-
-def run_gui():
-    sys.argv += ["--gui"]
-    run()
-
-
 if __name__ == "__main__":
-    run_gui()
+    run()
+else:
+    run(should_start_server=False)

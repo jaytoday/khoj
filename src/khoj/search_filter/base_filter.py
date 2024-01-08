@@ -1,23 +1,14 @@
-# Standard Packages
 from abc import ABC, abstractmethod
-from typing import List, Set, Tuple
-
-# Internal Packages
-from khoj.utils.rawconfig import Entry
+from typing import List
 
 
 class BaseFilter(ABC):
     @abstractmethod
-    def load(self, entries: List[Entry], *args, **kwargs):
+    def get_filter_terms(self, query: str) -> List[str]:
         ...
 
-    @abstractmethod
     def can_filter(self, raw_query: str) -> bool:
-        ...
-
-    @abstractmethod
-    def apply(self, query: str, entries: List[Entry]) -> Tuple[str, Set[int]]:
-        ...
+        return len(self.get_filter_terms(raw_query)) > 0
 
     @abstractmethod
     def defilter(self, query: str) -> str:

@@ -1,8 +1,6 @@
-# Standard Packages
 import datetime
 
-# Internal Packages
-from khoj.processor.org_mode import orgnode
+from khoj.processor.content.org_mode import orgnode
 
 
 # Test
@@ -44,7 +42,7 @@ Body Line 1"""
     assert len(entries) == 1
     assert entries[0].heading == "Heading"
     assert entries[0].tags == list()
-    assert entries[0].body == "Body Line 1"
+    assert entries[0].body == "Body Line 1\n\n"
     assert entries[0].priority == ""
     assert entries[0].Property("ID") == ""
     assert entries[0].closed == ""
@@ -78,7 +76,7 @@ Body Line 2"""
     assert entries[0].heading == "Heading"
     assert entries[0].todo == "DONE"
     assert entries[0].tags == ["Tag1", "TAG2", "tag3"]
-    assert entries[0].body == "- Clocked Log 1\nBody Line 1\nBody Line 2"
+    assert entries[0].body == "- Clocked Log 1\n\nBody Line 1\n\nBody Line 2\n\n"
     assert entries[0].priority == "A"
     assert entries[0].Property("ID") == "id:123-456-789-4234-1231"
     assert entries[0].closed == datetime.date(1984, 4, 1)
@@ -161,6 +159,8 @@ Body Line 1"""
     assert len(entries) == 1
     # parsed heading from entry
     assert entries[0].heading == "Heading[1]"
+    # track ancestors of entry
+    assert entries[0].ancestors == [f"{orgfile}"]
     # ensure SOURCE link has square brackets in filename, heading escaped in rendered entries
     escaped_orgfile = f"{orgfile}".replace("[1]", "\\[1\\]")
     assert f":SOURCE: [[file:{escaped_orgfile}::*Heading\\[1\\]" in f"{entries[0]}"
@@ -205,7 +205,7 @@ Body 2
         assert entry.heading == f"Heading{index+1}"
         assert entry.todo == "FAILED" if index == 0 else "CANCELLED"
         assert entry.tags == [f"tag{index+1}"]
-        assert entry.body == f"- Clocked Log {index+1}\nBody {index+1}\n\n"
+        assert entry.body == f"- Clocked Log {index+1}\n\nBody {index+1}\n\n"
         assert entry.priority == "A"
         assert entry.Property("ID") == f"id:123-456-789-4234-000{index+1}"
         assert entry.closed == datetime.date(1984, 4, index + 1)
@@ -260,6 +260,7 @@ Body Line 1"""
     assert entries[0].closed == ""
     assert entries[0].scheduled == ""
     assert entries[0].deadline == ""
+    assert entries[0].ancestors == ["test"]
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -284,6 +285,7 @@ Body Line 1
     assert entries[0].closed == ""
     assert entries[0].scheduled == ""
     assert entries[0].deadline == ""
+    assert entries[0].ancestors == ["title1 title2"]
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -304,8 +306,10 @@ entry body
     assert len(entries) == 2
     assert entries[0].heading == "Title"
     assert entries[0].body == "intro body\n"
+    assert entries[0].ancestors == ["Title"]
     assert entries[1].heading == "Entry Heading"
-    assert entries[1].body == "entry body\n"
+    assert entries[1].body == "entry body\n\n"
+    assert entries[1].ancestors == ["Title"]
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -326,8 +330,93 @@ entry body
     assert len(entries) == 2
     assert entries[0].heading == "Title1 Title2"
     assert entries[0].body == "intro body\n"
+    assert entries[0].ancestors == ["Title1 Title2"]
     assert entries[1].heading == "Entry Heading"
-    assert entries[1].body == "entry body\n"
+    assert entries[1].body == "entry body\n\n"
+    assert entries[0].ancestors == ["Title1 Title2"]
+
+
+# ----------------------------------------------------------------------------------------------------
+def test_parse_org_with_single_ancestor_heading(tmp_path):
+    "Parse org entries with parent headings context"
+    # Arrange
+    body = f"""
+* Heading 1
+body 1
+** Sub Heading 1
+"""
+    orgfile = create_file(tmp_path, body)
+
+    # Act
+    entries = orgnode.makelist_with_filepath(orgfile)
+
+    # Assert
+    assert len(entries) == 2
+    assert entries[0].heading == "Heading 1"
+    assert entries[0].ancestors == [f"{orgfile}"]
+    assert entries[1].heading == "Sub Heading 1"
+    assert entries[1].ancestors == [f"{orgfile}", "Heading 1"]
+
+
+# ----------------------------------------------------------------------------------------------------
+def test_parse_org_with_multiple_ancestor_headings(tmp_path):
+    "Parse org entries with parent headings context"
+    # Arrange
+    body = f"""
+* Heading 1
+body 1
+** Sub Heading 1
+*** Sub Sub Heading 1
+sub sub body 1
+"""
+    orgfile = create_file(tmp_path, body)
+
+    # Act
+    entries = orgnode.makelist_with_filepath(orgfile)
+
+    # Assert
+    assert len(entries) == 3
+    assert entries[0].heading == "Heading 1"
+    assert entries[0].ancestors == [f"{orgfile}"]
+    assert entries[1].heading == "Sub Heading 1"
+    assert entries[1].ancestors == [f"{orgfile}", "Heading 1"]
+    assert entries[2].heading == "Sub Sub Heading 1"
+    assert entries[2].ancestors == [f"{orgfile}", "Heading 1", "Sub Heading 1"]
+
+
+# ----------------------------------------------------------------------------------------------------
+def test_parse_org_with_multiple_ancestor_headings_of_siblings(tmp_path):
+    "Parse org entries with parent headings context"
+    # Arrange
+    body = f"""
+* Heading 1
+body 1
+** Sub Heading 1
+*** Sub Sub Heading 1
+sub sub body 1
+*** Sub Sub Heading 2
+** Sub Heading 2
+*** Sub Sub Heading 3
+"""
+    orgfile = create_file(tmp_path, body)
+
+    # Act
+    entries = orgnode.makelist_with_filepath(orgfile)
+
+    # Assert
+    assert len(entries) == 6
+    assert entries[0].heading == "Heading 1"
+    assert entries[0].ancestors == [f"{orgfile}"]
+    assert entries[1].heading == "Sub Heading 1"
+    assert entries[1].ancestors == [f"{orgfile}", "Heading 1"]
+    assert entries[2].heading == "Sub Sub Heading 1"
+    assert entries[2].ancestors == [f"{orgfile}", "Heading 1", "Sub Heading 1"]
+    assert entries[3].heading == "Sub Sub Heading 2"
+    assert entries[3].ancestors == [f"{orgfile}", "Heading 1", "Sub Heading 1"]
+    assert entries[4].heading == "Sub Heading 2"
+    assert entries[4].ancestors == [f"{orgfile}", "Heading 1"]
+    assert entries[5].heading == "Sub Sub Heading 3"
+    assert entries[5].ancestors == [f"{orgfile}", "Heading 1", "Sub Heading 2"]
 
 
 # Helper Functions

@@ -12,6 +12,7 @@ __pycache__
 .vscode
 .env
 .venv/*
+todesktop.json
 
 # Build artifacts
 /src/khoj/interface/web/images
@@ -20,7 +21,8 @@ __pycache__
 khoj_assistant.egg-info
 /config/khoj*.yml
 .pytest_cache
-khoj.log
+*.log
+static
 
 # Obsidian plugin artifacts
 # ---
@@ -29,7 +31,7 @@ node_modules
 
 # Don't include the compiled obsidian main.js file in the repo.
 # They should be uploaded to GitHub releases instead.
-main.js
+src/interface/obsidian/main.js
 
 # Exclude sourcemaps
 *.map

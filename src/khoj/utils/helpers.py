@@ -1,30 +1,53 @@
-# Standard Packages
 from __future__ import annotations  # to avoid quoting type hints
-from collections import OrderedDict
+
 import datetime
+import logging
+import os
+import platform
+import random
+import uuid
+from collections import OrderedDict
+from enum import Enum
 from importlib import import_module
 from importlib.metadata import version
-import logging
+from itertools import islice
 from os import path
 from pathlib import Path
-import platform
-import sys
 from time import perf_counter
-import torch
-from typing import Optional, Union, TYPE_CHECKING
-import uuid
+from typing import TYPE_CHECKING, Optional, Union
 
-# Internal Packages
+import torch
+from asgiref.sync import sync_to_async
+
 from khoj.utils import constants
 
-
 if TYPE_CHECKING:
-    # External Packages
-    from sentence_transformers import CrossEncoder
+    from sentence_transformers import CrossEncoder, SentenceTransformer
 
-    # Internal Packages
     from khoj.utils.models import BaseEncoder
     from khoj.utils.rawconfig import AppConfig
+
+
+class AsyncIteratorWrapper:
+    def __init__(self, obj):
+        self._it = iter(obj)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            value = await self.next_async()
+        except StopAsyncIteration:
+            return
+        return value
+
+    @sync_to_async
+    def next_async(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            raise StopAsyncIteration
 
 
 def is_none_or_empty(item):
@@ -64,7 +87,30 @@ def merge_dicts(priority_dict: dict, default_dict: dict):
     return merged_dict
 
 
-def load_model(model_name: str, model_type, model_dir=None, device: str = None) -> Union[BaseEncoder, CrossEncoder]:
+def get_file_type(file_type: str) -> tuple[str, str]:
+    "Get file type from file mime type"
+
+    encoding = file_type.split("=")[1].strip().lower() if ";" in file_type else None
+    file_type = file_type.split(";")[0].strip() if ";" in file_type else file_type
+    if file_type in ["text/markdown"]:
+        return "markdown", encoding
+    elif file_type in ["text/org"]:
+        return "org", encoding
+    elif file_type in ["application/pdf"]:
+        return "pdf", encoding
+    elif file_type in ["image/jpeg"]:
+        return "jpeg", encoding
+    elif file_type in ["image/png"]:
+        return "png", encoding
+    elif file_type in ["text/plain", "text/html", "application/xml", "text/x-rst"]:
+        return "plaintext", encoding
+    else:
+        return "other", encoding
+
+
+def load_model(
+    model_name: str, model_type, model_dir=None, device: str = None
+) -> Union[BaseEncoder, SentenceTransformer, CrossEncoder]:
     "Load model from disk or huggingface"
     # Construct model path
     logger = logging.getLogger(__name__)
@@ -84,11 +130,6 @@ def load_model(model_name: str, model_type, model_dir=None, device: str = None) 
             model.save(model_path)
 
     return model
-
-
-def is_pyinstaller_app():
-    "Returns true if the app is running from Native GUI created by PyInstaller"
-    return getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
 
 
 def get_class_by_name(name: str) -> object:
@@ -167,6 +208,9 @@ def get_server_id():
         # If server_id is not found, generate a new one
         server_id = str(uuid.uuid4())
 
+        # Create khoj config directory if it doesn't exist
+        os.makedirs(path.dirname(app_env_filename), exist_ok=True)
+
         # Write the server_id to the env file
         with open(app_env_filename, "w") as f:
             f.write("server_id=" + server_id + "\n")
@@ -186,10 +230,12 @@ def log_telemetry(
     if not app_config or not app_config.should_log_telemetry:
         return []
 
+    if properties.get("server_id") is None:
+        properties["server_id"] = get_server_id()
+
     # Populate telemetry data to log
     request_body = {
         "telemetry_type": telemetry_type,
-        "server_id": get_server_id(),
         "server_version": version("khoj-assistant"),
         "os": platform.system(),
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -204,3 +250,70 @@ def log_telemetry(
 
     # Log telemetry data to telemetry endpoint
     return request_body
+
+
+def get_device() -> torch.device:
+    """Get device to run model on"""
+    if torch.cuda.is_available():
+        # Use CUDA GPU
+        return torch.device("cuda:0")
+    elif torch.backends.mps.is_available():
+        # Use Apple M1 Metal Acceleration
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
+
+class ConversationCommand(str, Enum):
+    Default = "default"
+    General = "general"
+    Notes = "notes"
+    Help = "help"
+    Online = "online"
+    Image = "image"
+
+
+command_descriptions = {
+    ConversationCommand.General: "Only talk about information that relies on Khoj's general knowledge, not your personal knowledge base.",
+    ConversationCommand.Notes: "Only talk about information that is available in your knowledge base.",
+    ConversationCommand.Default: "The default command when no command specified. It intelligently auto-switches between general and notes mode.",
+    ConversationCommand.Online: "Look up information on the internet.",
+    ConversationCommand.Image: "Generate images by describing your imagination in words.",
+    ConversationCommand.Help: "Display a help message with all available commands and other metadata.",
+}
+
+
+def generate_random_name():
+    # List of adjectives and nouns to choose from
+    adjectives = [
+        "happy",
+        "serendipitous",
+        "exuberant",
+        "calm",
+        "brave",
+        "scared",
+        "energetic",
+        "chivalrous",
+        "kind",
+        "suave",
+    ]
+    nouns = ["dog", "cat", "falcon", "whale", "turtle", "rabbit", "hamster", "snake", "spider", "elephant"]
+
+    # Select two random words from the lists
+    adjective = random.choice(adjectives)
+    noun = random.choice(nouns)
+
+    # Combine the words to form a name
+    name = f"{adjective} {noun}"
+
+    return name
+
+
+def batcher(iterable, max_n):
+    "Split an iterable into chunks of size max_n"
+    it = iter(iterable)
+    while True:
+        chunk = list(islice(it, max_n))
+        if not chunk:
+            return
+        yield (x for x in chunk if x is not None)

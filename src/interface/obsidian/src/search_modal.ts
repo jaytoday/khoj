@@ -87,26 +87,18 @@ export class KhojSearchModal extends SuggestModal<SearchResult> {
     }
 
     async getSuggestions(query: string): Promise<SearchResult[]> {
-        // Query Khoj backend for search results
+        // Setup Query Khoj backend for search results
         let encodedQuery = encodeURIComponent(query);
         let searchUrl = `${this.setting.khojUrl}/api/search?q=${encodedQuery}&n=${this.setting.resultsCount}&r=${this.rerank}&client=obsidian`;
+        let headers = { 'Authorization': `Bearer ${this.setting.khojApiKey}` }
 
-        // Get search results for markdown and pdf files
-        let mdResponse = await request(`${searchUrl}&t=markdown`);
-        let pdfResponse = await request(`${searchUrl}&t=pdf`);
+        // Get search results from Khoj backend
+        let response = await request({ url: `${searchUrl}`, headers: headers });
 
         // Parse search results
-        let mdData = JSON.parse(mdResponse)
+        let results = JSON.parse(response)
             .filter((result: any) => !this.find_similar_notes || !result.additional.file.endsWith(this.app.workspace.getActiveFile()?.path))
-            .map((result: any) => { return { entry: result.entry, score: result.score, file: result.additional.file }; });
-        let pdfData = JSON.parse(pdfResponse)
-            .filter((result: any) => !this.find_similar_notes || !result.additional.file.endsWith(this.app.workspace.getActiveFile()?.path))
-            .map((result: any) => { return { entry: `## ${result.additional.compiled}`, score: result.score, file: result.additional.file } as SearchResult; })
-
-        // Combine markdown and PDF results and sort them by score
-        let results = mdData.concat(pdfData)
-            .sort((a: any, b: any) => b.score - a.score)
-            .map((result: any) => { return { entry: result.entry, file: result.file } as SearchResult; })
+            .map((result: any) => { return { entry: result.entry, file: result.additional.file } as SearchResult; });
 
         this.query = query;
         return results;
@@ -126,15 +118,6 @@ export class KhojSearchModal extends SuggestModal<SearchResult> {
         // Truncate search results to lines_to_render
         let entry_snipped_indicator = result.entry.split('\n').length > lines_to_render ? ' **...**' : '';
         let snipped_entry = result.entry.split('\n').slice(0, lines_to_render).join('\n');
-
-        // Show reindex hint on first search result
-        if (this.resultContainerEl.children.length == 1) {
-            let infoHintEl = createEl("div",{ cls: 'khoj-info-hint' });
-            el.insertAdjacentElement("beforebegin", infoHintEl);
-            setTimeout(() => {
-                infoHintEl.setText('Unexpected results? Try re-index your vault from the Khoj plugin settings to fix it.');
-            }, 3000);
-        }
 
         // Show filename of each search result for context
         el.createEl("div",{ cls: 'khoj-result-file' }).setText(filename ?? "");

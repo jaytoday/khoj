@@ -1,20 +1,23 @@
-import { App, Notice, PluginSettingTab, request, Setting } from 'obsidian';
+import { App, Notice, PluginSettingTab, Setting, TFile } from 'obsidian';
 import Khoj from 'src/main';
+import { updateContentIndex } from './utils';
 
 export interface KhojSetting {
-    openaiApiKey: string;
     resultsCount: number;
     khojUrl: string;
+    khojApiKey: string;
     connectedToBackend: boolean;
     autoConfigure: boolean;
+    lastSyncedFiles: TFile[];
 }
 
 export const DEFAULT_SETTINGS: KhojSetting = {
     resultsCount: 6,
-    khojUrl: 'http://127.0.0.1:42110',
+    khojUrl: 'https://app.khoj.dev',
+    khojApiKey: '',
     connectedToBackend: false,
     autoConfigure: true,
-    openaiApiKey: '',
+    lastSyncedFiles: []
 }
 
 export class KhojSettingTab extends PluginSettingTab {
@@ -35,7 +38,7 @@ export class KhojSettingTab extends PluginSettingTab {
         // Add khoj settings configurable from the plugin settings tab
         new Setting(containerEl)
             .setName('Khoj URL')
-            .setDesc('The URL of the Khoj backend')
+            .setDesc('The URL of the Khoj backend.')
             .addText(text => text
                 .setValue(`${this.plugin.settings.khojUrl}`)
                 .onChange(async (value) => {
@@ -44,17 +47,17 @@ export class KhojSettingTab extends PluginSettingTab {
                     containerEl.firstElementChild?.setText(this.getBackendStatusMessage());
                 }));
         new Setting(containerEl)
-            .setName('OpenAI API Key')
-            .setDesc('Your OpenAI API Key for Khoj Chat')
+            .setName('Khoj API Key')
+            .setDesc('Use Khoj Cloud with your Khoj API Key')
             .addText(text => text
-                .setValue(`${this.plugin.settings.openaiApiKey}`)
+                .setValue(`${this.plugin.settings.khojApiKey}`)
                 .onChange(async (value) => {
-                    this.plugin.settings.openaiApiKey = value.trim();
+                    this.plugin.settings.khojApiKey = value.trim();
                     await this.plugin.saveSettings();
                 }));
         new Setting(containerEl)
             .setName('Results Count')
-            .setDesc('The number of results to show in search and use for chat')
+            .setDesc('The number of results to show in search and use for chat.')
             .addSlider(slider => slider
                 .setLimits(1, 10, 1)
                 .setValue(this.plugin.settings.resultsCount)
@@ -64,8 +67,8 @@ export class KhojSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
         new Setting(containerEl)
-            .setName('Auto Configure')
-            .setDesc('Automatically configure the Khoj backend')
+            .setName('Auto Sync')
+            .setDesc('Automatically index your vault with Khoj.')
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.autoConfigure)
                 .onChange(async (value) => {
@@ -74,8 +77,8 @@ export class KhojSettingTab extends PluginSettingTab {
                 }));
         let indexVaultSetting = new Setting(containerEl);
         indexVaultSetting
-            .setName('Index Vault')
-            .setDesc('Manually force Khoj to re-index your Obsidian Vault')
+            .setName('Force Sync')
+            .setDesc('Manually force Khoj to re-index your Obsidian Vault.')
             .addButton(button => button
                 .setButtonText('Update')
                 .setCta()
@@ -107,8 +110,9 @@ export class KhojSettingTab extends PluginSettingTab {
                     }, 300);
                     this.plugin.registerInterval(progress_indicator);
 
-                    await request(`${this.plugin.settings.khojUrl}/api/update?t=markdown&force=true&client=obsidian`);
-                    await request(`${this.plugin.settings.khojUrl}/api/update?t=pdf&force=true&client=obsidian`);
+                    this.plugin.settings.lastSyncedFiles = await updateContentIndex(
+                        this.app.vault, this.plugin.settings, this.plugin.settings.lastSyncedFiles, true
+                    );
                     new Notice('✅ Updated Khoj index.');
 
                     // Reset button once index is updated

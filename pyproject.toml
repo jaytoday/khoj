@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "khoj-assistant"
-description = "An AI personal assistant for your Digital Brain"
+description = "An AI copilot for your Second Brain"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.8"
@@ -27,7 +27,6 @@ classifiers = [
     "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -37,27 +36,46 @@ classifiers = [
     "Topic :: Text Processing :: Linguistic",
 ]
 dependencies = [
-    "dateparser == 1.1.1",
+    "bs4 >= 0.0.1",
+    "dateparser >= 1.1.1",
     "defusedxml == 0.7.1",
-    "fastapi == 0.77.1",
+    "fastapi >= 0.104.1",
+    "python-multipart >= 0.0.5",
     "jinja2 == 3.1.2",
-    "openai >= 0.27.0",
-    "tiktoken >= 0.3.0",
+    "openai >= 1.0.0",
+    "tiktoken >= 0.3.2",
     "tenacity >= 8.2.2",
-    "pillow == 9.3.0",
-    "pydantic >= 1.10.10",
-    "pyqt6 == 6.3.1",
+    "pillow ~= 9.5.0",
+    "pydantic >= 2.0.0",
     "pyyaml == 6.0",
     "rich >= 13.3.1",
     "schedule == 1.1.0",
     "sentence-transformers == 2.2.2",
-    "torch >= 2.0.1",
+    "transformers >= 4.28.0",
+    "torch == 2.0.1",
     "uvicorn == 0.17.6",
-    "aiohttp == 3.8.4",
-    "langchain >= 0.0.187",
-    "pypdf >= 3.9.0",
+    "aiohttp ~= 3.9.0",
+    "langchain >= 0.0.331",
     "requests >= 2.26.0",
     "bs4 >= 0.0.1",
+    "anyio == 3.7.1",
+    "pymupdf >= 1.23.5",
+    "django == 4.2.7",
+    "authlib == 1.2.1",
+    "gpt4all >= 2.0.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "gpt4all >= 2.0.0; platform_system == 'Windows' or platform_system == 'Darwin'",
+    "itsdangerous == 2.1.2",
+    "httpx == 0.25.0",
+    "pgvector == 0.2.4",
+    "psycopg2-binary == 2.9.9",
+    "google-auth == 2.23.3",
+    "python-multipart == 0.0.6",
+    "gunicorn == 21.2.0",
+    "lxml == 4.9.3",
+    "tzdata == 2023.3",
+    "rapidocr-onnxruntime == 1.3.8",
+    "stripe == 7.3.0",
+    "openai-whisper >= 20231117",
 ]
 dynamic = ["version"]
 
@@ -76,12 +94,16 @@ test = [
     "freezegun >= 1.2.0",
     "factory-boy >= 3.2.1",
     "trio >= 0.22.0",
+    "pytest-xdist",
+    "psutil >= 5.8.0",
 ]
 dev = [
     "khoj-assistant[test]",
     "mypy >= 1.0.1",
     "black >= 23.1.0",
     "pre-commit >= 3.0.4",
+    "pytest-django == 4.5.2",
+    "pytest-asyncio == 0.21.1",
 ]
 
 [tool.hatch.version]
@@ -106,6 +128,9 @@ warn_unused_ignores = false
 
 [tool.black]
 line-length = 120
+
+[tool.isort]
+profile = "black"
 
 [tool.pytest.ini_options]
 addopts = "--strict-markers"
